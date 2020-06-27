@@ -8,6 +8,9 @@ import subprocess
 # Path to dev. Used for testing this script.
 DEV_PATH = b"/dev/%s"
 
+# Prevents multiple apt-get runs, if nvme-cli is already installed.
+nvme_cli_installed = False
+
 
 class WipeError(Exception):
     """Raised when wiping has failed."""
@@ -29,11 +32,99 @@ def list_disks():
     return disks
 
 
-def get_disk_security_info(disk):
-    """Get the disk security information.
+def install_nvme_cli():
+    """Install pre-requisite nvme-cli package."""
 
-    Uses `hdparam` to get security information about the disk. Sadly hdparam
-    doesn't provide an output that makes it easy to parse.
+    global nvme_cli_installed
+    proc = subprocess.run('DEBIAN_FRONTEND=noninteractive apt-get'
+                          ' install -y nvme-cli', shell=True,
+                          stdin=None, executable="/bin/bash")
+    if (proc.returncode == 0):
+        nvme_cli_installed = True
+
+
+def get_nvme_security_info(disk):
+    """Gather NVMe information from the NVMe disks using the
+    nvme-cli tool. Info from id-ctrl and id-ns is needed for
+    secure erase (nvme format) and write zeroes."""
+
+    # Check first if we already installed nvme-cli
+    if not nvme_cli_installed:
+        install_nvme_cli()
+
+    # Grab the relevant info from nvme id-ctrl. We need to check the
+    # following bits:
+    #
+    # OACS (Optional Admin Command Support) bit 1: Format supported
+    # ONCS (Optional NVM Command Support) bit 3: Write Zeroes supported
+    # FNA (Format NVM Attributes) bit 2: Cryptographic format supported
+
+    security_info = {
+        "format_supported": False,
+        "writez_supported": False,
+        "crypto_format": False,
+        "nsze": 0,
+        "lbaf": 0,
+        "ms": 0,
+    }
+
+    try:
+        output = subprocess.check_output(["nvme", "id-ctrl", DEV_PATH % disk])
+    except subprocess.CalledProcessError as exc:
+        print_flush("\nError on nvme id-ctrl (%s)" % exc.returncode)
+        return security_info
+    output = output.decode()
+
+    for line in output.split('\n'):
+        if "oacs" in line:
+            oacs = line.split(':')[1]
+            if int(oacs, 16) & 0x2:
+                security_info["format_supported"] = True
+
+        if "oncs" in line:
+            oncs = line.split(':')[1]
+            if int(oncs, 16) & 0x8:
+                security_info["writez_supported"] = True
+
+        if "fna" in line:
+            fna = line.split(':')[1]
+            if int(fna, 16) & 0x4:
+                security_info["crypto_format"] = True
+
+    # Next step: collect LBAF (LBA Format), MS (Metadata Setting) and
+    # NSZE (Namespace Size) from id-ns. According to NVMe spec, bits 0:3
+    # from FLBAS corresponds to the LBAF value, whereas bit 4 is MS.
+
+    try:
+        output = subprocess.check_output(["nvme", "id-ns", DEV_PATH % disk])
+    except subprocess.CalledProcessError as exc:
+        print_flush("\nError on nvme id-ns (%s)" % exc.returncode)
+        security_info["format_supported"] = False
+        security_info["writez_supported"] = False
+        return security_info
+    output = output.decode()
+
+    for line in output.split('\n'):
+        if "nsze" in line:
+            # According to spec., this should be used as 0-based value.
+            nsze = line.split(':')[1]
+            security_info["nsze"] = int(nsze, 16) - 1
+
+        if "flbas" in line:
+            flbas = line.split(':')[1]
+            flbas = int(flbas, 16)
+            security_info["lbaf"] = flbas & 0xf
+
+            if flbas & 0x10:
+                security_info["ms"] = 1
+
+    return security_info
+
+
+def get_hdparm_security_info(disk):
+
+    """Get SCSI/ATA disk security info from hdparm.
+    Sadly hdparam doesn't provide an output that makes it easy to parse.
     """
     # Grab the security section for hdparam.
     security_section = []
@@ -62,57 +153,25 @@ def get_disk_security_info(disk):
     return security_info
 
 
+def get_disk_security_info(disk):
+    """Get the disk security information.
+
+    Uses `hdparam` to get security information about the SCSI/ATA disks.
+    If NVMe, nvme-cli is used instead.
+    """
+
+    if b"nvme" in disk:
+        return get_nvme_security_info(disk)
+
+    return get_hdparm_security_info(disk)
+
+
 def get_disk_info():
     """Return dictionary of wipeable disks and thier security information."""
     return {kname: get_disk_security_info(kname) for kname in list_disks()}
 
 
-def try_secure_erase(kname, info):
-    """Try to wipe the disk with secure erase."""
-    if info[b"supported"]:
-        if info[b"frozen"]:
-            print_flush(
-                "%s: not using secure erase; "
-                "drive is currently frozen." % kname.decode("ascii")
-            )
-            return False
-        elif info[b"locked"]:
-            print_flush(
-                "%s: not using secure erase; "
-                "drive is currently locked." % kname.decode("ascii")
-            )
-            return False
-        elif info[b"enabled"]:
-            print_flush(
-                "%s: not using secure erase; "
-                "drive security is already enabled." % kname.decode("ascii")
-            )
-            return False
-        else:
-            # Wiping using secure erase.
-            try:
-                secure_erase(kname)
-            except Exception as e:
-                print_flush(
-                    "%s: failed to be securely erased: %s"
-                    % (kname.decode("ascii"), e)
-                )
-                return False
-            else:
-                print_flush(
-                    "%s: successfully securely erased."
-                    % (kname.decode("ascii"))
-                )
-                return True
-    else:
-        print_flush(
-            "%s: drive does not support secure erase."
-            % (kname.decode("ascii"))
-        )
-        return False
-
-
-def secure_erase(kname):
+def secure_erase_hdparm(kname):
     """Securely wipe the device."""
     # First write 1 MiB of known data to the beginning of the block device.
     # This is used to check at the end of the secure erase that it worked
@@ -142,7 +201,7 @@ def secure_erase(kname):
 
     # Now that the user password is set the device should have its
     # security mode enabled.
-    info = get_disk_security_info(kname)
+    info = get_hdparm_security_info(kname)
     if not info[b"enabled"]:
         # If not enabled that means the password did not take, so it does not
         # need to be cleared.
@@ -167,7 +226,7 @@ def secure_erase(kname):
         failed_exc = exc
 
     # Make sure that the device is now not enabled.
-    info = get_disk_security_info(kname)
+    info = get_hdparm_security_info(kname)
     if info[b"enabled"]:
         # Wipe failed since security is still enabled.
         subprocess.check_output(
@@ -182,6 +241,85 @@ def secure_erase(kname):
         raise WipeError(
             "Secure erase was performed, but failed to actually work."
         )
+
+
+def try_secure_erase_hdparm(kname, info):
+    """Try to wipe the disk with secure erase."""
+    if info[b"supported"]:
+        if info[b"frozen"]:
+            print_flush(
+                "%s: not using secure erase; "
+                "drive is currently frozen." % kname.decode("ascii")
+            )
+            return False
+        elif info[b"locked"]:
+            print_flush(
+                "%s: not using secure erase; "
+                "drive is currently locked." % kname.decode("ascii")
+            )
+            return False
+        elif info[b"enabled"]:
+            print_flush(
+                "%s: not using secure erase; "
+                "drive security is already enabled." % kname.decode("ascii")
+            )
+            return False
+        else:
+            # Wiping using secure erase.
+            try:
+                secure_erase_hdparm(kname)
+            except Exception as e:
+                print_flush(
+                    "%s: failed to be securely erased: %s"
+                    % (kname.decode("ascii"), e)
+                )
+                return False
+            else:
+                print_flush(
+                    "%s: successfully securely erased."
+                    % (kname.decode("ascii"))
+                )
+                return True
+    else:
+        print_flush(
+            "%s: drive does not support secure erase."
+            % (kname.decode("ascii"))
+        )
+        return False
+
+
+def try_secure_erase_nvme(kname, info):
+    """Perform a secure-erase on NVMe disk if that feature is
+    available. Prefer cryptographic erase, when available."""
+
+    if not info["format_supported"]:
+        print_flush("Device %s does not support formatting" % kname.decode("ascii"))
+        return False
+
+    if info["crypto_format"]:
+        ses = 2
+    else:
+        ses = 1
+
+    try:
+        subprocess.check_output(
+            ["nvme", "format", "-s", str(ses), "-l", str(info["lbaf"]),
+             "-m", str(info["ms"]), DEV_PATH % kname])
+    except subprocess.CalledProcessError as exc:
+        print_flush("\nError with format command (%s)" % exc.returncode)
+        return False
+
+    print_flush("Secure erase was successful on NVMe drive %s" % kname.decode("ascii"))
+    return True
+
+
+def try_secure_erase(kname, info):
+    """Entry-point for secure-erase for SCSI/ATA or NVMe disks."""
+
+    if b"nvme" in kname:
+        return try_secure_erase_nvme(kname, info)
+
+    return try_secure_erase_hdparm(kname, info)
 
 
 def wipe_quickly(kname):
@@ -199,8 +337,44 @@ def wipe_quickly(kname):
     print_flush("%s: successfully quickly wiped." % kname.decode("ascii"))
 
 
-def zero_disk(kname):
-    """Zero the entire disk."""
+def nvme_write_zeroes(kname, info):
+    """Perform a write-zeroes operation on NVMe device instead of
+    dd'ing 0 to the entire disk if secure erase is not available.
+    Write-zeroes is a faster way to clean a NVMe disk."""
+
+    fallback = 0
+
+    if not info["writez_supported"]:
+        print("NVMe drive %s does not support write-zeroes" % kname.decode("ascii"))
+        fallback = 1
+
+    if info["nsze"] <= 0:
+        print("Bad namespace information collected on NVMe drive %s" % kname.decode("ascii"))
+        fallback = 1
+
+    if fallback:
+        print_flush("Will fallback to regular drive zeroing.")
+        return False
+
+    try:
+        subprocess.check_output(
+            ["nvme", "write-zeroes", "-f", "-s", "0", "-c",
+             str(hex(info["nsze"])[2:]), DEV_PATH % kname])
+    except subprocess.CalledProcessError as exc:
+        print_flush("\nError with write-zeroes command (%s)" % exc.returncode)
+        return False
+
+    print_flush("%s: successfully zeroed (using write-zeroes)." % kname.decode("ascii"))
+    return True
+
+
+def zero_disk(kname, info):
+    """Zero the entire disk, trying write-zeroes first if NVMe disk."""
+
+    if b"nvme" in kname:
+        if nvme_write_zeroes(kname, info):
+            return
+
     # Get the total size of the device.
     size = 0
     with open(DEV_PATH % kname, "rb") as fp:
@@ -288,7 +462,7 @@ def main():
             if args.quick_erase:
                 wipe_quickly(kname)
             else:
-                zero_disk(kname)
+                zero_disk(kname, info)
 
     print_flush("All disks have been successfully wiped.")
 
